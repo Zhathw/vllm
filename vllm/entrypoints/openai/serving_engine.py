@@ -268,6 +268,15 @@ class OpenAIServing:
             apply_mistral_chat_template, executor=self._tokenizer_executor
         )
 
+
+        self._async_tokenizer_pool: dict[AnyTokenizer, AsyncMicrobatchTokenizer] = {}
+        self.log_error_stack = log_error_stack
+
+        self.processor = self.models.processor
+        self.io_processor = self.models.io_processor
+        self.model_config = self.models.model_config
+        self.max_model_len = self.model_config.max_model_len
+
         self.enable_tokenizer_proc_pool = \
             os.getenv("TOKENIZER_PROC_POOL", "0") == "1"
         self.tokenizer_worker_num = \
@@ -303,14 +312,6 @@ class OpenAIServing:
                 executor=self._tokenizer_proc_pool_executor
             )
             self._initialize_process_pool()
-
-        self._async_tokenizer_pool: dict[AnyTokenizer, AsyncMicrobatchTokenizer] = {}
-        self.log_error_stack = log_error_stack
-
-        self.processor = self.models.processor
-        self.io_processor = self.models.io_processor
-        self.model_config = self.models.model_config
-        self.max_model_len = self.model_config.max_model_len
 
     def _get_tool_parser(
         self, tool_parser_name: str | None = None, enable_auto_tools: bool = False
@@ -585,33 +586,37 @@ class OpenAIServing:
         Initializes the process pool executor by submitting and waiting for dummy tasks.
         Ensures the process pool is properly set up before use.
         """
-        if hasattr(self, '_tokenizer_proc_pool_executor'):
-            executor: Optional[concurrent.futures.ProcessPoolExecutor] = \
-                getattr(self, '_tokenizer_proc_pool_executor')
-            futures = []
-
-            try:
-                # Submit dummy tasks to all workers
-                for _ in range(executor._max_workers):
-                    future = executor.submit(
-                        OpenAIServing._proc_pool_dummy_task, 
-                    )
-                    futures.append(future)
-
-                # Wait for all dummy tasks to complete
-                for future in futures:
-                    future.result()
-                logger.info("Process pool initialized successfully")
-            except concurrent.futures.process.BrokenProcessPool as e:
-                logger.error(f"Process pool initialization failed: {e}")
-                raise
-            except Exception as e:
-                raise RuntimeError(
-                    f"Unexpected error during process pool initialization: {e}"
-                ) from e
-        else:
+        executor: Optional[ProcessPoolExecutor] = getattr(
+            self, '_tokenizer_proc_pool_executor', None
+        )
+        
+        if executor is None:
             logger.error("Process pool executor not found")
             raise ValueError("Process pool executor not initialized")
+
+        # Use stored max_workers instead of private _max_workers
+        max_workers: int = getattr(self, 'tokenizer_worker_num', 1)
+
+        futures = []
+        try:
+            # Submit dummy tasks to all workers
+            for _ in range(max_workers):
+                future = executor.submit(
+                    OpenAIServing._proc_pool_dummy_task,
+                )
+                futures.append(future)
+
+            # Wait for all dummy tasks to complete
+            for future in futures:
+                future.result()
+            logger.info("Process pool initialized successfully")
+            
+        except concurrent.futures.process.BrokenProcessPool as e:
+            raise RuntimeError(f"Process pool initialization failed: {e}")
+        except Exception as e:
+            raise RuntimeError(
+                f"Unexpected error during process pool initialization: {e}"
+            ) from e
 
     @staticmethod
     def _proc_pool_dummy_task():
